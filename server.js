@@ -28,8 +28,34 @@ const db     = new Database(path.join(__dirname, "mailflow.db"));
 const PORT   = process.env.PORT || 3001;
 const DOMAIN = process.env.TRACKING_DOMAIN || `http://localhost:${PORT}`;
 
-app.use(cors());
-app.use(express.json());
+// CORS — permite peticiones desde cualquier origen (Hostinger, localhost, etc.)
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
+app.options("*", cors()); // responder preflight OPTIONS
+app.use(express.json({ limit: "10mb" }));
+
+/* ─── HEALTH / TEST ────────────────────────────────────────────────────────── */
+/**
+ * GET /api/test
+ * Verifica que el backend está activo y que las variables de entorno están configuradas.
+ */
+app.get("/api/test", (req, res) => {
+  const hasApiKey    = !!(process.env.RESEND_API_KEY && process.env.RESEND_API_KEY.startsWith("re_"));
+  const hasSenderEmail = !!(process.env.SENDER_EMAIL && process.env.SENDER_EMAIL.includes("@"));
+  res.json({
+    ok: true,
+    status: "MailFlow backend activo ✓",
+    resend_configured: hasApiKey,
+    sender_email_configured: hasSenderEmail,
+    sender_email: process.env.SENDER_EMAIL || "(no configurado)",
+    sender_name:  process.env.SENDER_NAME  || "(no configurado)",
+    tracking_domain: DOMAIN,
+    timestamp: new Date().toISOString(),
+  });
+});
 
 /* ─── DATABASE SETUP ────────────────────────────────────────────────────────── */
 db.exec(`
@@ -175,67 +201,100 @@ async function scheduleNextEmail(campaignId, contactId, currentStep) {
 /* ─── SEND EMAIL ─────────────────────────────────────────────────────────────── */
 /**
  * POST /api/send
- * Body: { to, subject, bodyHtml?, bodyText?, campaignId, contactId, step, from?, apiKey? }
+ * Body: { to, subject, html, campaignId, contactId, step, from?, fromName? }
+ * También acepta bodyHtml y bodyText por compatibilidad.
  */
 app.post("/api/send", async (req, res) => {
   const {
-    to, subject, bodyHtml, bodyText,
-    campaignId, contactId, step,
-    from = process.env.SENDER_EMAIL,
-    fromName = process.env.SENDER_NAME || "MailFlow",
+    to,
+    subject,
+    html,          // campo principal que envía el frontend
+    bodyHtml,      // alias alternativo
+    bodyText,
+    campaignId,
+    contactId,
+    step = 1,
   } = req.body;
 
-  if (!to || !subject || !campaignId || !contactId) {
-    return res.status(400).json({ ok: false, error: "Faltan campos requeridos" });
+  // Resolver el email de remitente: primero del body, luego de env
+  const fromEmail = (req.body.from && req.body.from.includes("@"))
+    ? req.body.from
+    : process.env.SENDER_EMAIL;
+  const fromName  = req.body.fromName || process.env.SENDER_NAME || "MailFlow";
+
+  // Validaciones
+  if (!to || !to.includes("@")) {
+    return res.status(400).json({ ok: false, error: "Campo 'to' inválido o faltante" });
+  }
+  if (!subject) {
+    return res.status(400).json({ ok: false, error: "Falta el asunto del email" });
+  }
+  if (!fromEmail) {
+    return res.status(400).json({ ok: false, error: "No hay email de remitente configurado. Agrégalo en ⚙ Configuración o en las variables de Railway." });
+  }
+  if (!process.env.RESEND_API_KEY) {
+    return res.status(400).json({ ok: false, error: "RESEND_API_KEY no configurada en Railway. Ve a Variables de entorno." });
   }
 
-  // Verificar contacto no rebotado
-  const contact = db.prepare("SELECT * FROM contacts WHERE id = ?").get(contactId);
-  if (contact && contact.status === "bounced") {
-    return res.json({ ok: false, error: "Contacto con rebote — excluido" });
+  // Verificar que el contacto no esté rebotado (solo si está en la BD)
+  if (contactId && !contactId.startsWith("m_")) {
+    const contact = db.prepare("SELECT status FROM contacts WHERE id = ?").get(contactId);
+    if (contact && contact.status === "bounced") {
+      return res.json({ ok: false, error: "Contacto con rebote — excluido automáticamente" });
+    }
   }
 
-  const pixelUrl       = `${DOMAIN}/pixel/${campaignId}/${contactId}/${step}.png`;
-  const unsubscribeUrl = `${DOMAIN}/unsub/${contactId}`;
-  const html = bodyHtml || buildEmailHtml({
-    subject, body: bodyText || subject, pixelUrl, unsubscribeUrl
+  // Construir HTML final: preferir html > bodyHtml > construir desde bodyText
+  const pixelUrl       = `${DOMAIN}/pixel/${campaignId||"c0"}/${contactId||"u0"}/${step}.png`;
+  const unsubscribeUrl = `${DOMAIN}/unsub/${contactId||"u0"}`;
+  const finalHtml = html || bodyHtml || buildEmailHtml({
+    subject,
+    body: bodyText || subject,
+    pixelUrl,
+    unsubscribeUrl,
   });
 
   try {
     const { data, error } = await resend.emails.send({
-      from:    `${fromName} <${from}>`,
+      from:    `${fromName} <${fromEmail}>`,
       to:      [to],
       subject,
-      html,
+      html:    finalHtml,
       headers: {
         "List-Unsubscribe": `<${unsubscribeUrl}>`,
-        "X-Campaign-Id":    campaignId,
-        "X-Contact-Id":     contactId,
+        "X-Campaign-Id":    String(campaignId || ""),
+        "X-Contact-Id":     String(contactId  || ""),
       },
     });
 
     if (error) {
       console.error("[RESEND ERROR]", error);
-      return res.json({ ok: false, error: error.message });
+      return res.json({ ok: false, error: error.message || JSON.stringify(error) });
     }
 
-    // Registrar envío
-    db.prepare(`
-      INSERT OR IGNORE INTO sends (id, campaign_id, contact_id, step, message_id, status)
-      VALUES (?, ?, ?, ?, ?, 'sent')
-    `).run(uid(), campaignId, contactId, step, data.id);
+    // Registrar en BD (solo si hay IDs reales)
+    if (campaignId && contactId && !contactId.startsWith("m_")) {
+      try {
+        db.prepare(`
+          INSERT OR IGNORE INTO sends (id, campaign_id, contact_id, step, message_id, status)
+          VALUES (?, ?, ?, ?, ?, 'sent')
+        `).run(uid(), campaignId, contactId, step, data.id);
 
-    db.prepare(`
-      INSERT INTO events (type, campaign_id, contact_id, step, meta)
-      VALUES ('send', ?, ?, ?, ?)
-    `).run(campaignId, contactId, step, JSON.stringify({ messageId: data.id }));
+        db.prepare(`
+          INSERT INTO events (type, campaign_id, contact_id, step, meta)
+          VALUES ('send', ?, ?, ?, ?)
+        `).run(campaignId, contactId, step, JSON.stringify({ messageId: data.id, to }));
+      } catch (dbErr) {
+        console.warn("[DB WARN]", dbErr.message); // no bloquear el envío por error de BD
+      }
+    }
 
-    console.log(`[SEND] ✓ ${to} | step ${step} | msg ${data.id}`);
+    console.log(`[SEND ✓] ${to} | ${subject} | msg ${data.id}`);
     return res.json({ ok: true, id: data.id });
 
   } catch (err) {
     console.error("[SEND EXCEPTION]", err);
-    return res.status(500).json({ ok: false, error: err.message });
+    return res.status(500).json({ ok: false, error: err.message || "Error interno del servidor" });
   }
 });
 
