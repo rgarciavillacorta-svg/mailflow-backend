@@ -1,258 +1,121 @@
 /**
  * MailFlow Backend — server.js
- * Stack: Node.js + Express + Resend SDK + SQLite (via better-sqlite3)
+ * Stack: Node.js + Express + Resend SDK
+ * Almacenamiento: en memoria (no requiere SQLite ni compilación nativa)
  *
- * Instalar dependencias:
- *   npm install express resend better-sqlite3 cors dotenv
+ * Instalar: npm install express resend cors dotenv
  *
- * Variables de entorno (.env):
+ * Variables en Railway → Variables:
  *   RESEND_API_KEY=re_xxxxxxxxxxxxxxxx
  *   SENDER_EMAIL=hola@tudominio.com
  *   SENDER_NAME=Tu Empresa
- *   TRACKING_DOMAIN=https://track.tudominio.com
- *   PORT=3001
- *   WEBHOOK_SECRET=tu_secreto_resend   (opcional, para verificar firma)
+ *   TRACKING_DOMAIN=https://tu-proyecto.railway.app
  */
 
 require("dotenv").config();
-const express   = require("express");
-const cors      = require("cors");
+const express    = require("express");
+const cors       = require("cors");
 const { Resend } = require("resend");
-const Database  = require("better-sqlite3");
-const crypto    = require("crypto");
-const path      = require("path");
+const crypto     = require("crypto");
 
 const app    = express();
 const resend = new Resend(process.env.RESEND_API_KEY);
-const db     = new Database(path.join(__dirname, "mailflow.db"));
 const PORT   = process.env.PORT || 3001;
-const DOMAIN = process.env.TRACKING_DOMAIN || `http://localhost:${PORT}`;
+const DOMAIN = process.env.TRACKING_DOMAIN || `https://localhost:${PORT}`;
 
-// CORS — permite peticiones desde cualquier origen (Hostinger, localhost, etc.)
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
-app.options("*", cors()); // responder preflight OPTIONS
+/* ── CORS: permite peticiones desde cualquier origen ── */
+app.use(cors({ origin: "*", methods: ["GET","POST","OPTIONS"], allowedHeaders: ["Content-Type"] }));
+app.options("*", cors());
 app.use(express.json({ limit: "10mb" }));
 
-/* ─── HEALTH / TEST ────────────────────────────────────────────────────────── */
-/**
- * GET /api/test
- * Verifica que el backend está activo y que las variables de entorno están configuradas.
- */
-app.get("/api/test", (req, res) => {
-  const hasApiKey    = !!(process.env.RESEND_API_KEY && process.env.RESEND_API_KEY.startsWith("re_"));
-  const hasSenderEmail = !!(process.env.SENDER_EMAIL && process.env.SENDER_EMAIL.includes("@"));
-  res.json({
-    ok: true,
-    status: "MailFlow backend activo ✓",
-    resend_configured: hasApiKey,
-    sender_email_configured: hasSenderEmail,
-    sender_email: process.env.SENDER_EMAIL || "(no configurado)",
-    sender_name:  process.env.SENDER_NAME  || "(no configurado)",
-    tracking_domain: DOMAIN,
-    timestamp: new Date().toISOString(),
-  });
-});
+/* ── Almacenamiento en memoria ── */
+const db = {
+  sends:  [],   // { id, campaignId, contactId, step, messageId, to, sentAt }
+  opens:  [],   // { id, campaignId, contactId, step, openedAt, ip }
+  events: [],   // { id, type, campaignId, contactId, step, meta, createdAt }
+  queue:  [],   // { id, campaignId, contactId, email, step, sendAfter, status }
+  contacts: [], // { id, email, status }
+};
 
-/* ─── DATABASE SETUP ────────────────────────────────────────────────────────── */
-db.exec(`
-  CREATE TABLE IF NOT EXISTS campaigns (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    status      TEXT DEFAULT 'draft',
-    created_at  TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS contacts (
-    id          TEXT PRIMARY KEY,
-    email       TEXT UNIQUE NOT NULL,
-    name        TEXT,
-    status      TEXT DEFAULT 'subscribed',  -- subscribed | bounced | unsubscribed
-    created_at  TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS sequences (
-    id           TEXT PRIMARY KEY,
-    campaign_id  TEXT NOT NULL,
-    step         INTEGER NOT NULL,
-    subject      TEXT NOT NULL,
-    body_html    TEXT NOT NULL,
-    delay_days   INTEGER DEFAULT 0,
-    condition    TEXT,                       -- null | 'opened_previous'
-    FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS sends (
-    id           TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
-    campaign_id  TEXT NOT NULL,
-    contact_id   TEXT NOT NULL,
-    step         INTEGER NOT NULL,
-    message_id   TEXT,                       -- Resend message ID
-    status       TEXT DEFAULT 'sent',        -- sent | bounced | delivered
-    sent_at      TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS opens (
-    id           TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
-    campaign_id  TEXT NOT NULL,
-    contact_id   TEXT NOT NULL,
-    step         INTEGER NOT NULL,
-    opened_at    TEXT DEFAULT (datetime('now')),
-    ip           TEXT,
-    user_agent   TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS automation_queue (
-    id           TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
-    campaign_id  TEXT NOT NULL,
-    contact_id   TEXT NOT NULL,
-    step         INTEGER NOT NULL,
-    send_after   TEXT NOT NULL,              -- ISO datetime
-    status       TEXT DEFAULT 'pending',    -- pending | sent | cancelled
-    created_at   TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS events (
-    id           TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
-    type         TEXT NOT NULL,              -- open | click | bounce | unsubscribe | send
-    campaign_id  TEXT,
-    contact_id   TEXT,
-    step         INTEGER,
-    meta         TEXT,                       -- JSON string for extra data
-    created_at   TEXT DEFAULT (datetime('now'))
-  );
-`);
-
-/* ─── HELPERS ───────────────────────────────────────────────────────────────── */
 const uid = () => crypto.randomBytes(8).toString("hex");
+const now = () => new Date().toISOString();
 
-/** Pixel 1×1 GIF transparente */
-const PIXEL_GIF = Buffer.from(
-  "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
-  "base64"
-);
+/* ── Pixel GIF 1×1 transparente ── */
+const PIXEL = Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64");
 
-/** Genera HTML del email con pixel y enlace de baja */
-function buildEmailHtml({ subject, body, pixelUrl, unsubscribeUrl }) {
+/* ── HTML del email ── */
+function buildHtml(subject, body, pixelUrl, unsubUrl) {
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>${subject}</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-           max-width: 600px; margin: 0 auto; padding: 32px 24px; color: #1a1a2e; background: #fff; }
-    h1   { color: #5b3fff; font-size: 24px; margin-bottom: 16px; }
-    .cta { display: inline-block; margin-top: 24px; padding: 14px 32px; background: #5b3fff;
-           color: #fff; border-radius: 8px; text-decoration: none; font-weight: 700; }
-    .footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid #eee;
-              font-size: 11px; color: #999; }
-    .footer a { color: #999; }
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:600px;margin:0 auto;padding:32px 24px;color:#222;background:#fff}
+    h1{color:#5b3fff;font-size:22px;margin:0 0 16px}
+    p{line-height:1.7;margin:0 0 20px;font-size:15px}
+    .btn{display:inline-block;padding:13px 30px;background:#5b3fff;color:#fff;border-radius:8px;text-decoration:none;font-weight:700;font-size:15px}
+    .footer{margin-top:48px;padding-top:16px;border-top:1px solid #eee;font-size:11px;color:#999}
+    .footer a{color:#aaa}
   </style>
 </head>
 <body>
   <h1>${subject}</h1>
-  <div>${body.replace(/\n/g, "<br>")}</div>
-  <a class="cta" href="#">Ver más →</a>
+  <p>${body.replace(/\n/g,"<br/>")}</p>
+  <a class="btn" href="#">Ver más →</a>
   <div class="footer">
-    © ${new Date().getFullYear()} Tu Empresa ·
-    <a href="${unsubscribeUrl}">Cancelar suscripción</a>
+    <a href="${unsubUrl}">Cancelar suscripción</a>
   </div>
-  <!-- Pixel de rastreo de apertura -->
-  <img src="${pixelUrl}" width="1" height="1"
-       style="display:block;width:1px;height:1px;opacity:0;border:0" alt="">
+  <img src="${pixelUrl}" width="1" height="1" style="display:block;opacity:0;border:0" alt=""/>
 </body>
 </html>`;
 }
 
-/** Programa el siguiente email en la secuencia para un contacto */
-async function scheduleNextEmail(campaignId, contactId, currentStep) {
-  const next = db.prepare(`
-    SELECT * FROM sequences
-    WHERE campaign_id = ? AND step = ? AND condition = 'opened_previous'
-  `).get(campaignId, currentStep + 1);
+/* ═══════════════════════════════════════════════════
+   ENDPOINTS
+═══════════════════════════════════════════════════ */
 
-  if (!next) return null; // No hay siguiente paso
+/* ── GET /api/test — verificar que el backend funciona ── */
+app.get("/api/test", (req, res) => {
+  const hasKey    = !!(process.env.RESEND_API_KEY && process.env.RESEND_API_KEY.startsWith("re_"));
+  const hasEmail  = !!(process.env.SENDER_EMAIL   && process.env.SENDER_EMAIL.includes("@"));
+  res.json({
+    ok:   true,
+    status: "MailFlow backend activo ✓",
+    resend_configured:        hasKey,
+    sender_email_configured:  hasEmail,
+    sender_email:  process.env.SENDER_EMAIL  || "(no configurado — agrega SENDER_EMAIL en Railway)",
+    sender_name:   process.env.SENDER_NAME   || "(no configurado — agrega SENDER_NAME en Railway)",
+    tracking_domain: DOMAIN,
+    timestamp: now(),
+  });
+});
 
-  const contact = db.prepare("SELECT * FROM contacts WHERE id = ?").get(contactId);
-  if (!contact || contact.status !== "subscribed") return null;
-
-  // Verificar si ya está en cola
-  const existing = db.prepare(`
-    SELECT id FROM automation_queue
-    WHERE campaign_id = ? AND contact_id = ? AND step = ? AND status = 'pending'
-  `).get(campaignId, contactId, next.step);
-  if (existing) return null;
-
-  const sendAfter = new Date(Date.now() + next.delay_days * 86400 * 1000).toISOString();
-  db.prepare(`
-    INSERT INTO automation_queue (id, campaign_id, contact_id, step, send_after)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(uid(), campaignId, contactId, next.step, sendAfter);
-
-  console.log(`[AUTOMATION] Programado email paso ${next.step} para ${contact.email} en ${sendAfter}`);
-  return { step: next.step, sendAfter };
-}
-
-/* ─── SEND EMAIL ─────────────────────────────────────────────────────────────── */
-/**
- * POST /api/send
- * Body: { to, subject, html, campaignId, contactId, step, from?, fromName? }
- * También acepta bodyHtml y bodyText por compatibilidad.
- */
+/* ── POST /api/send — enviar email ── */
 app.post("/api/send", async (req, res) => {
-  const {
-    to,
-    subject,
-    html,          // campo principal que envía el frontend
-    bodyHtml,      // alias alternativo
-    bodyText,
-    campaignId,
-    contactId,
-    step = 1,
-  } = req.body;
+  const { to, subject, html, bodyHtml, bodyText, campaignId, contactId, step = 1 } = req.body;
 
-  // Resolver el email de remitente: primero del body, luego de env
+  /* Resolver remitente */
   const fromEmail = (req.body.from && req.body.from.includes("@"))
     ? req.body.from
     : process.env.SENDER_EMAIL;
   const fromName  = req.body.fromName || process.env.SENDER_NAME || "MailFlow";
 
-  // Validaciones
-  if (!to || !to.includes("@")) {
-    return res.status(400).json({ ok: false, error: "Campo 'to' inválido o faltante" });
-  }
-  if (!subject) {
-    return res.status(400).json({ ok: false, error: "Falta el asunto del email" });
-  }
-  if (!fromEmail) {
-    return res.status(400).json({ ok: false, error: "No hay email de remitente configurado. Agrégalo en ⚙ Configuración o en las variables de Railway." });
-  }
-  if (!process.env.RESEND_API_KEY) {
-    return res.status(400).json({ ok: false, error: "RESEND_API_KEY no configurada en Railway. Ve a Variables de entorno." });
-  }
+  /* Validaciones */
+  if (!to || !to.includes("@"))
+    return res.status(400).json({ ok: false, error: "Email destinatario inválido." });
+  if (!subject)
+    return res.status(400).json({ ok: false, error: "Falta el asunto del email." });
+  if (!fromEmail)
+    return res.status(400).json({ ok: false, error: "No hay email remitente. Agrega SENDER_EMAIL en Railway → Variables." });
+  if (!process.env.RESEND_API_KEY)
+    return res.status(400).json({ ok: false, error: "RESEND_API_KEY no configurada en Railway → Variables." });
 
-  // Verificar que el contacto no esté rebotado (solo si está en la BD)
-  if (contactId && !contactId.startsWith("m_")) {
-    const contact = db.prepare("SELECT status FROM contacts WHERE id = ?").get(contactId);
-    if (contact && contact.status === "bounced") {
-      return res.json({ ok: false, error: "Contacto con rebote — excluido automáticamente" });
-    }
-  }
-
-  // Construir HTML final: preferir html > bodyHtml > construir desde bodyText
-  const pixelUrl       = `${DOMAIN}/pixel/${campaignId||"c0"}/${contactId||"u0"}/${step}.png`;
-  const unsubscribeUrl = `${DOMAIN}/unsub/${contactId||"u0"}`;
-  const finalHtml = html || bodyHtml || buildEmailHtml({
-    subject,
-    body: bodyText || subject,
-    pixelUrl,
-    unsubscribeUrl,
-  });
+  /* Construir HTML */
+  const pixelUrl = `${DOMAIN}/pixel/${campaignId||"c0"}/${contactId||"u0"}/${step}.png`;
+  const unsubUrl = `${DOMAIN}/unsub/${contactId||"u0"}`;
+  const finalHtml = html || bodyHtml || buildHtml(subject, bodyText || "", pixelUrl, unsubUrl);
 
   try {
     const { data, error } = await resend.emails.send({
@@ -261,7 +124,7 @@ app.post("/api/send", async (req, res) => {
       subject,
       html:    finalHtml,
       headers: {
-        "List-Unsubscribe": `<${unsubscribeUrl}>`,
+        "List-Unsubscribe": `<${unsubUrl}>`,
         "X-Campaign-Id":    String(campaignId || ""),
         "X-Contact-Id":     String(contactId  || ""),
       },
@@ -272,316 +135,110 @@ app.post("/api/send", async (req, res) => {
       return res.json({ ok: false, error: error.message || JSON.stringify(error) });
     }
 
-    // Registrar en BD (solo si hay IDs reales)
-    if (campaignId && contactId && !contactId.startsWith("m_")) {
-      try {
-        db.prepare(`
-          INSERT OR IGNORE INTO sends (id, campaign_id, contact_id, step, message_id, status)
-          VALUES (?, ?, ?, ?, ?, 'sent')
-        `).run(uid(), campaignId, contactId, step, data.id);
+    /* Guardar en memoria */
+    db.sends.push({ id: uid(), campaignId, contactId, step, messageId: data.id, to, sentAt: now() });
+    db.events.push({ id: uid(), type: "send", campaignId, contactId, step, meta: { messageId: data.id }, createdAt: now() });
 
-        db.prepare(`
-          INSERT INTO events (type, campaign_id, contact_id, step, meta)
-          VALUES ('send', ?, ?, ?, ?)
-        `).run(campaignId, contactId, step, JSON.stringify({ messageId: data.id, to }));
-      } catch (dbErr) {
-        console.warn("[DB WARN]", dbErr.message); // no bloquear el envío por error de BD
-      }
-    }
-
-    console.log(`[SEND ✓] ${to} | ${subject} | msg ${data.id}`);
+    console.log(`[SEND ✓] ${to} | "${subject}" | msg ${data.id}`);
     return res.json({ ok: true, id: data.id });
 
   } catch (err) {
-    console.error("[SEND EXCEPTION]", err);
-    return res.status(500).json({ ok: false, error: err.message || "Error interno del servidor" });
+    console.error("[SEND ERROR]", err.message);
+    return res.status(500).json({ ok: false, error: err.message || "Error interno del servidor." });
   }
 });
 
-/* ─── PIXEL TRACKING ─────────────────────────────────────────────────────────── */
-/**
- * GET /pixel/:campaignId/:contactId/:step.png
- * Registra la apertura del email y programa el siguiente en la secuencia.
- */
-app.get("/pixel/:campaignId/:contactId/:stepFile", async (req, res) => {
-  // Responder siempre con el pixel (no bloquear la carga del email)
-  res.set({
-    "Content-Type":  "image/gif",
-    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-    "Pragma":        "no-cache",
-  });
-  res.send(PIXEL_GIF);
+/* ── GET /pixel/:cId/:uid/:step.png — rastreo de apertura ── */
+app.get("/pixel/:cId/:uid/:step", (req, res) => {
+  res.set({ "Content-Type": "image/gif", "Cache-Control": "no-store, no-cache" });
+  res.send(PIXEL);
 
-  // Procesar en segundo plano
-  const { campaignId, contactId, stepFile } = req.params;
-  const step = parseInt(stepFile.replace(".png", ""), 10);
-  if (isNaN(step)) return;
+  /* Registrar apertura en segundo plano */
+  const { cId, uid: contactId, step } = req.params;
+  const stepNum = parseInt(step.replace(".png",""), 10) || 1;
+  const alreadyOpen = db.opens.find(o => o.campaignId===cId && o.contactId===contactId && o.step===stepNum);
 
-  try {
-    // Evitar duplicados: solo registrar la primera apertura por envío
-    const alreadyOpen = db.prepare(`
-      SELECT id FROM opens WHERE campaign_id=? AND contact_id=? AND step=?
-    `).get(campaignId, contactId, step);
+  if (!alreadyOpen) {
+    db.opens.push({ id: uid(), campaignId: cId, contactId, step: stepNum, openedAt: now(), ip: req.ip });
+    db.events.push({ id: uid(), type: "open", campaignId: cId, contactId, step: stepNum, createdAt: now() });
+    console.log(`[OPEN] Campaign:${cId} Contact:${contactId} Step:${stepNum}`);
 
-    if (!alreadyOpen) {
-      db.prepare(`
-        INSERT INTO opens (id, campaign_id, contact_id, step, ip, user_agent)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(uid(), campaignId, contactId, step,
-        req.ip, req.get("user-agent") || "");
-
-      db.prepare(`
-        INSERT INTO events (type, campaign_id, contact_id, step)
-        VALUES ('open', ?, ?, ?)
-      `).run(campaignId, contactId, step);
-
-      console.log(`[OPEN] Campaign:${campaignId} Contact:${contactId} Step:${step}`);
-      await scheduleNextEmail(campaignId, contactId, step);
-    }
-  } catch (err) {
-    console.error("[PIXEL ERROR]", err);
+    /* Encolar siguiente email si aplica (notificación) */
+    db.queue.push({
+      id: uid(), campaignId: cId, contactId, step: stepNum + 1,
+      sendAfter: new Date(Date.now() + 86400000).toISOString(),
+      status: "pending", createdAt: now()
+    });
   }
 });
 
-/* ─── UNSUBSCRIBE ────────────────────────────────────────────────────────────── */
-/**
- * GET /unsub/:contactId
- * Marca el contacto como dado de baja y cancela sus emails en cola.
- */
+/* ── GET /unsub/:contactId — cancelar suscripción ── */
 app.get("/unsub/:contactId", (req, res) => {
   const { contactId } = req.params;
-  db.prepare("UPDATE contacts SET status='unsubscribed' WHERE id=?").run(contactId);
-  db.prepare("UPDATE automation_queue SET status='cancelled' WHERE contact_id=? AND status='pending'").run(contactId);
-  db.prepare("INSERT INTO events (type, contact_id) VALUES ('unsubscribe', ?)").run(contactId);
-  console.log(`[UNSUB] Contact:${contactId}`);
-  res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px">
-    <h2 style="color:#5b3fff">Has cancelado tu suscripción</h2>
+  db.events.push({ id: uid(), type: "unsubscribe", contactId, createdAt: now() });
+  console.log(`[UNSUB] ${contactId}`);
+  res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px;color:#222">
+    <h2 style="color:#5b3fff">Suscripción cancelada</h2>
     <p>Ya no recibirás más correos de nuestra parte.</p>
   </body></html>`);
 });
 
-/* ─── RESEND WEBHOOK (rebotes y eventos) ─────────────────────────────────────── */
-/**
- * POST /webhooks/resend
- * Recibe eventos de Resend: email.bounced, email.complained, email.delivered
- * Configura esta URL en Resend Dashboard → Webhooks
- */
+/* ── POST /webhooks/resend — rebotes y quejas automáticas ── */
 app.post("/webhooks/resend", (req, res) => {
-  // Verificación de firma (opcional pero recomendado)
-  const svix_id        = req.headers["svix-id"];
-  const svix_timestamp = req.headers["svix-timestamp"];
-  const svix_signature = req.headers["svix-signature"];
+  res.json({ received: true });
+  const { type, data } = req.body || {};
+  if (!type) return;
 
-  if (process.env.WEBHOOK_SECRET) {
-    const payload   = JSON.stringify(req.body);
-    const toSign    = `${svix_id}.${svix_timestamp}.${payload}`;
-    const expected  = crypto.createHmac("sha256", process.env.WEBHOOK_SECRET)
-                            .update(toSign).digest("base64");
-    const signature = (svix_signature || "").split(" ").find(s => s.startsWith("v1,"))?.slice(3);
-    if (!signature || !crypto.timingSafeEqual(
-      Buffer.from(signature), Buffer.from(expected)
-    )) {
-      console.warn("[WEBHOOK] Firma inválida — ignorado");
-      return res.status(401).json({ error: "Firma inválida" });
-    }
+  const toEmail = (data && data.to && data.to[0]) || "";
+  console.log(`[WEBHOOK] ${type} → ${toEmail}`);
+
+  if (type === "email.bounced") {
+    db.events.push({ id: uid(), type: "bounce", meta: { email: toEmail, reason: "Hard bounce" }, createdAt: now() });
+    /* Marcar en memoria */
+    const c = db.contacts.find(x => x.email === toEmail);
+    if (c) c.status = "bounced";
+    else db.contacts.push({ id: uid(), email: toEmail, status: "bounced" });
   }
-
-  res.json({ received: true }); // Responder 200 rápido
-
-  const { type, data } = req.body;
-  console.log(`[WEBHOOK] ${type}`, data?.email_id);
-
-  // Extraer campaignId y contactId de los headers del email original
-  const headers     = data?.headers || {};
-  const campaignId  = headers["x-campaign-id"];
-  const contactId   = headers["x-contact-id"];
-  const toEmail     = data?.to?.[0] || "";
-
-  try {
-    if (type === "email.bounced") {
-      // Marcar contacto como rebotado
-      if (contactId) {
-        db.prepare("UPDATE contacts SET status='bounced' WHERE id=?").run(contactId);
-        db.prepare("UPDATE automation_queue SET status='cancelled' WHERE contact_id=? AND status='pending'").run(contactId);
-      } else {
-        db.prepare("UPDATE contacts SET status='bounced' WHERE email=?").run(toEmail);
-      }
-      db.prepare(`
-        INSERT INTO events (type, campaign_id, contact_id, meta)
-        VALUES ('bounce', ?, ?, ?)
-      `).run(campaignId||null, contactId||null, JSON.stringify({
-        reason: data?.bounce?.message || "Hard bounce",
-        email: toEmail,
-      }));
-      console.log(`[BOUNCE] ${toEmail} marcado como rebotado`);
-    }
-
-    else if (type === "email.complained") {
-      // Queja SPAM → dar de baja inmediatamente
-      if (contactId) {
-        db.prepare("UPDATE contacts SET status='unsubscribed' WHERE id=?").run(contactId);
-        db.prepare("UPDATE automation_queue SET status='cancelled' WHERE contact_id=? AND status='pending'").run(contactId);
-      }
-      db.prepare(`INSERT INTO events (type, campaign_id, contact_id) VALUES ('unsubscribe', ?, ?)`).run(campaignId||null, contactId||null);
-      console.log(`[COMPLAINT] ${toEmail} dado de baja por queja`);
-    }
-
-    else if (type === "email.delivered") {
-      db.prepare("UPDATE sends SET status='delivered' WHERE message_id=?").run(data?.email_id);
-      console.log(`[DELIVERED] ${data?.email_id}`);
-    }
-
-    else if (type === "email.clicked") {
-      db.prepare(`INSERT INTO events (type, campaign_id, contact_id, meta) VALUES ('click', ?, ?, ?)`).run(
-        campaignId||null, contactId||null,
-        JSON.stringify({ url: data?.click?.link, email: toEmail })
-      );
-    }
-  } catch (err) {
-    console.error("[WEBHOOK PROCESSING ERROR]", err);
+  if (type === "email.complained") {
+    db.events.push({ id: uid(), type: "unsubscribe", meta: { email: toEmail }, createdAt: now() });
+  }
+  if (type === "email.clicked") {
+    db.events.push({ id: uid(), type: "click", meta: { email: toEmail, url: data?.click?.link }, createdAt: now() });
   }
 });
 
-/* ─── AUTOMATION PROCESSOR ───────────────────────────────────────────────────── */
-/**
- * POST /api/automation/process
- * Procesa la cola de emails pendientes cuyo send_after <= NOW
- * Llamar con un cron job cada 15 minutos: */15 * * * * curl -X POST http://localhost:3001/api/automation/process
- */
-app.post("/api/automation/process", async (req, res) => {
-  const pending = db.prepare(`
-    SELECT q.*, c.email, c.name, c.status as contact_status,
-           s.subject, s.body_html, s.delay_days
-    FROM automation_queue q
-    JOIN contacts c ON c.id = q.contact_id
-    JOIN sequences s ON s.campaign_id = q.campaign_id AND s.step = q.step
-    WHERE q.status = 'pending'
-      AND q.send_after <= datetime('now')
-      AND c.status = 'subscribed'
-    LIMIT 50
-  `).all();
-
-  if (pending.length === 0) {
-    return res.json({ processed: 0, queued: 0 });
-  }
-
-  let processed = 0;
-  const errors  = [];
-
-  for (const item of pending) {
-    try {
-      const pixelUrl       = `${DOMAIN}/pixel/${item.campaign_id}/${item.contact_id}/${item.step}.png`;
-      const unsubscribeUrl = `${DOMAIN}/unsub/${item.contact_id}`;
-      const html           = item.body_html || buildEmailHtml({
-        subject: item.subject, body: item.subject, pixelUrl, unsubscribeUrl
-      });
-
-      const { data, error } = await resend.emails.send({
-        from:    `${process.env.SENDER_NAME || "MailFlow"} <${process.env.SENDER_EMAIL}>`,
-        to:      [item.email],
-        subject: item.subject,
-        html,
-        headers: {
-          "List-Unsubscribe": `<${unsubscribeUrl}>`,
-          "X-Campaign-Id":    item.campaign_id,
-          "X-Contact-Id":     item.contact_id,
-        },
-      });
-
-      if (error) {
-        errors.push({ id: item.id, error: error.message });
-        continue;
-      }
-
-      // Marcar como enviado
-      db.prepare("UPDATE automation_queue SET status='sent' WHERE id=?").run(item.id);
-      db.prepare(`
-        INSERT INTO sends (id, campaign_id, contact_id, step, message_id, status)
-        VALUES (?, ?, ?, ?, ?, 'sent')
-      `).run(uid(), item.campaign_id, item.contact_id, item.step, data.id);
-
-      console.log(`[AUTO-SEND] ✓ ${item.email} step ${item.step}`);
-      processed++;
-
-    } catch (err) {
-      errors.push({ id: item.id, error: err.message });
-      console.error("[AUTO-SEND ERROR]", err.message);
-    }
-  }
-
-  const stillQueued = db.prepare(
-    "SELECT COUNT(*) as n FROM automation_queue WHERE status='pending'"
-  ).get().n;
-
-  res.json({ processed, queued: stillQueued, errors });
-});
-
-/* ─── STATS API ──────────────────────────────────────────────────────────────── */
-/** GET /api/stats/:campaignId */
-app.get("/api/stats/:campaignId", (req, res) => {
-  const { campaignId } = req.params;
-  const sent     = db.prepare("SELECT COUNT(*) as n FROM sends WHERE campaign_id=?").get(campaignId).n;
-  const opened   = db.prepare("SELECT COUNT(DISTINCT contact_id) as n FROM opens WHERE campaign_id=?").get(campaignId).n;
-  const bounced  = db.prepare("SELECT COUNT(*) as n FROM sends WHERE campaign_id=? AND status='bounced'").get(campaignId).n;
-  const byStep   = db.prepare(`
-    SELECT step, COUNT(*) as sent,
-           (SELECT COUNT(DISTINCT contact_id) FROM opens o WHERE o.campaign_id=s.campaign_id AND o.step=s.step) as opened
-    FROM sends s WHERE campaign_id=? GROUP BY step ORDER BY step
-  `).all(campaignId);
-  res.json({ sent, opened, bounced, byStep });
-});
-
-/** GET /api/events */
+/* ── GET /api/events — últimos eventos ── */
 app.get("/api/events", (req, res) => {
-  const rows = db.prepare(
-    "SELECT * FROM events ORDER BY created_at DESC LIMIT 100"
-  ).all();
-  res.json(rows);
+  res.json([...db.events].reverse().slice(0, 100));
 });
 
-/** GET /api/queue */
+/* ── GET /api/queue — cola de automatización ── */
 app.get("/api/queue", (req, res) => {
-  const rows = db.prepare(`
-    SELECT q.*, c.email, s.subject
-    FROM automation_queue q
-    JOIN contacts c ON c.id = q.contact_id
-    JOIN sequences s ON s.campaign_id = q.campaign_id AND s.step = q.step
-    WHERE q.status = 'pending'
-    ORDER BY q.send_after ASC
-    LIMIT 100
-  `).all();
-  res.json(rows);
+  res.json(db.queue.filter(q => q.status === "pending"));
 });
 
-/** GET /api/contacts */
-app.get("/api/contacts", (req, res) => {
-  res.json(db.prepare("SELECT * FROM contacts ORDER BY created_at DESC").all());
+/* ── GET /api/stats — resumen ── */
+app.get("/api/stats", (req, res) => {
+  res.json({
+    totalSent:   db.sends.length,
+    totalOpens:  db.opens.length,
+    totalEvents: db.events.length,
+    queueSize:   db.queue.filter(q=>q.status==="pending").length,
+  });
 });
 
-/** POST /api/contacts — importar contacto */
-app.post("/api/contacts", (req, res) => {
-  const { email, name } = req.body;
-  if (!email) return res.status(400).json({ error: "Email requerido" });
-  const id = uid();
-  db.prepare("INSERT OR IGNORE INTO contacts (id, email, name) VALUES (?, ?, ?)").run(id, email, name || "");
-  res.json({ ok: true, id });
-});
-
-/* ─── START ──────────────────────────────────────────────────────────────────── */
+/* ── Arrancar servidor ── */
 app.listen(PORT, () => {
   console.log(`
-  ┌──────────────────────────────────────┐
-  │  MailFlow Backend                    │
-  │  http://localhost:${PORT}                │
-  │                                      │
-  │  Endpoints:                          │
-  │  POST /api/send                      │
-  │  GET  /pixel/:cId/:uid/:step.png     │
-  │  POST /webhooks/resend               │
-  │  POST /api/automation/process        │
-  │  GET  /api/stats/:campaignId         │
-  │  GET  /api/events                    │
-  │  GET  /api/queue                     │
-  └──────────────────────────────────────┘
+╔══════════════════════════════════════╗
+║  MailFlow Backend — Puerto ${PORT}      ║
+║                                      ║
+║  GET  /api/test                      ║
+║  POST /api/send                      ║
+║  GET  /pixel/:cId/:uid/:step.png     ║
+║  GET  /unsub/:contactId              ║
+║  POST /webhooks/resend               ║
+║  GET  /api/events                    ║
+╚══════════════════════════════════════╝
   `);
 });
