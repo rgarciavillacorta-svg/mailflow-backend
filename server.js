@@ -78,7 +78,6 @@ function buildHtml(subject, body, pixelUrl, unsubUrl, btnLabel, btnUrl) {
 </body>
 </html>`;
 }
-}
 
 /* ═══════════════════════════════════════════════════
    ENDPOINTS
