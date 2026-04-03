@@ -44,32 +44,40 @@ const now = () => new Date().toISOString();
 const PIXEL = Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64");
 
 /* ── HTML del email ── */
-function buildHtml(subject, body, pixelUrl, unsubUrl) {
+function buildHtml(subject, body, pixelUrl, unsubUrl, btnLabel, btnUrl) {
+  /* Convertir saltos de línea dobles en párrafos separados */
+  const paragraphs = (body||"").split(/\n\n+/).map(p=>p.replace(/\n/g,"<br/>")).filter(Boolean);
+  const bodyHtml = paragraphs.map(p=>`<p style="margin:0 0 16px;line-height:1.8;font-size:15px;color:#333">${p}</p>`).join("");
+  /* Botón opcional */
+  const btnHtml = (btnLabel && btnUrl)
+    ? `<div style="margin:28px 0"><a href="${btnUrl}" style="display:inline-block;padding:13px 32px;background:#5b3fff;color:#fff;border-radius:8px;text-decoration:none;font-weight:700;font-size:15px;font-family:sans-serif">${btnLabel}</a></div>`
+    : "";
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>${subject}</title>
-  <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:600px;margin:0 auto;padding:32px 24px;color:#222;background:#fff}
-    h1{color:#5b3fff;font-size:22px;margin:0 0 16px}
-    p{line-height:1.7;margin:0 0 20px;font-size:15px}
-    .btn{display:inline-block;padding:13px 30px;background:#5b3fff;color:#fff;border-radius:8px;text-decoration:none;font-weight:700;font-size:15px}
-    .footer{margin-top:48px;padding-top:16px;border-top:1px solid #eee;font-size:11px;color:#999}
-    .footer a{color:#aaa}
-  </style>
 </head>
-<body>
-  <h1>${subject}</h1>
-  <p>${body.replace(/\n/g,"<br/>")}</p>
-  <a class="btn" href="#">Ver más →</a>
-  <div class="footer">
-    <a href="${unsubUrl}">Cancelar suscripción</a>
+<body style="margin:0;padding:0;background:#f4f4f4;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
+  <div style="max-width:600px;margin:20px auto;background:#fff;border-radius:8px;overflow:hidden">
+    <div style="background:#5b3fff;padding:32px;text-align:center">
+      <h1 style="margin:0;color:#fff;font-size:24px;font-weight:700">${subject}</h1>
+    </div>
+    <div style="padding:32px 36px">
+      ${bodyHtml}
+      ${btnHtml}
+    </div>
+    <div style="background:#f8f8f8;padding:20px 36px;border-top:1px solid #eee;text-align:center">
+      <p style="margin:0;font-size:11px;color:#999">
+        <a href="${unsubUrl}" style="color:#aaa;text-decoration:underline">Cancelar suscripción</a>
+      </p>
+    </div>
   </div>
   <img src="${pixelUrl}" width="1" height="1" style="display:block;opacity:0;border:0" alt=""/>
 </body>
 </html>`;
+}
 }
 
 /* ═══════════════════════════════════════════════════
@@ -115,7 +123,14 @@ app.post("/api/send", async (req, res) => {
   /* Construir HTML */
   const pixelUrl = `${DOMAIN}/pixel/${campaignId||"c0"}/${contactId||"u0"}/${step}.png`;
   const unsubUrl = `${DOMAIN}/unsub/${contactId||"u0"}`;
-  const finalHtml = html || bodyHtml || buildHtml(subject, bodyText || "", pixelUrl, unsubUrl);
+  const finalHtml = html || bodyHtml || buildHtml(
+    subject,
+    bodyText || "",
+    pixelUrl,
+    unsubUrl,
+    req.body.btnLabel || "",
+    req.body.btnUrl   || ""
+  );
 
   try {
     const { data, error } = await resend.emails.send({
